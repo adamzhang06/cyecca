@@ -21,7 +21,7 @@ def is_finite(e: ca.SX) -> bool:
 @beartype
 def SX_close(e1: Union[ca.SX, ca.DM], e2: Union[ca.SX, ca.DM]):
     """Check if two CasADi expressions are close within EPS tolerance."""
-    close = ca.mmax(e1 - e2) < EPS
+    close = ca.mmax(ca.fabs(e1 - e2)) < EPS
     if not close:
         print(ca.DM(e1), ca.DM(e2))
     return close

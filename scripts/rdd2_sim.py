@@ -14,6 +14,7 @@ from geometry_msgs.msg import (
 from nav_msgs.msg import Odometry, Path
 from rclpy.node import Node
 from rclpy.parameter import Parameter
+from sensor_msgs.msg import NavSatFix
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import Imu, Joy
@@ -44,6 +45,8 @@ class Simulator(Node):
         self.pub_twist = self.create_publisher(TwistStamped, "twist", qos)
         self.pub_path = self.create_publisher(Path, "pose_history", qos)
         self.pub_imu = self.create_publisher(Imu, "imu", qos)
+        self.pub_gps = self.create_publisher(NavSatFix, "gps", 1)
+        self.pub_gps_local = self.create_publisher(PoseStamped, "gps_local", 1)
         self.tf_broadcaster = TransformBroadcaster(self)
         self.tf_static_broadcaster = StaticTransformBroadcaster(self)
 
@@ -95,6 +98,7 @@ class Simulator(Node):
         self.eqs.update(rdd2.derive_strapdown_ins_propagation())
         self.eqs.update(rdd2.derive_control_allocation())
         self.eqs.update(rdd2.derive_attitude_estimator())
+        self.eqs.update(rdd2.derive_attitude_init())
         self.eqs.update(rdd2.derive_position_correction())
         self.eqs.update(rdd2.derive_common())
         self.eqs.update(rdd2_loglinear.derive_se23_error())
@@ -134,6 +138,11 @@ class Simulator(Node):
         self.omega_sp = np.zeros(3, dtype=float)
         self.thrust = 0.0
 
+        # estimator parameters
+        self.DECLANATION = -4.494167/180*ca.pi
+        self.accel_gain = 0.15
+        self.mag_gain = 0.15
+
         # ----------------------------------------------
         # sim state data
         # ----------------------------------------------
@@ -152,11 +161,44 @@ class Simulator(Node):
         self.e0 = np.zeros(3, dtype=float)  # error for attitude rate loop
         self.de0 = np.zeros(3, dtype=float)  # deriv of att error (for lowpass)
 
+        
+        # GPS Init
+        self.last_gps = 0
+        self.y_gps_local = np.array([0, 0, 0])
+        self.gps_random_walk = np.array([0,0,0])
+
+        # Define GPS reference origin (West Lafayette, IN)
+        self.lat0 = 40.4237       # latitude [deg]
+        self.lon0 = -86.9212      # longitude [deg]
+        self.alt0 = 190.0         # altitude [m]
+        self.earth_radius = 6378137.0  # WGS84 radius [m]
+
+        # GPS reference origin (West Lafayette, IN)
+        self.lat0 = 40.4237       # latitude [deg]
+        self.lon0 = -86.9212      # longitude [deg]
+        self.alt0 = 190.0         # altitude [m]
+        self.earth_radius = 6378137.0  # WGS84 radius [m]
+
+        # Initialize current LLA values to reference
+        self.lat = self.lat0
+        self.lon = self.lon0
+        self.alt = self.alt0
+        self.lla = np.array([self.lat, self.lon, self.alt])
+        
         # estimator data
-        self.use_estimator = False  # if false, will use sim state instead for control
+        self.use_estimator = True  # if false, will use sim state instead for control
         self.P = 1e-2 * np.array([1, 0, 0, 1, 0, 1], dtype=float)  # state covariance
         self.Q = 1e-9 * np.array([1, 0, 0, 1, 0, 1], dtype=float)  # process noise
         self.P_temp = 1e-2 * np.eye(6, dtype=float)
+
+        #Derive initial quaternion based on mag and accel
+        self.y_mag = np.array(self.model["g_mag"](self.x, self.u, self.p, np.random.randn(3), self.dt)).reshape(-1)
+        self.y_accel = np.array(self.model["g_accel"](self.x, self.u, self.p, np.random.randn(3), self.dt)).reshape(-1)
+        self.q = np.array(self.eqs["attitude_init"](self.y_mag, self.y_accel, self.DECLANATION), dtype=float) # quaternion
+        self.est_x[6] = self.q[0]
+        self.est_x[7] = self.q[1]
+        self.est_x[8] = self.q[2] 
+        self.est_x[9] = self.q[3]
 
         # velocity control data
         self.psi_sp = 0.0  # world yaw orientation set point
@@ -177,8 +219,8 @@ class Simulator(Node):
         self.q_ref = np.array([1, 0, 0, 0], dtype=float)  # reference quaternion
 
         # setpoints
-        self.q_sp = np.array([1, 0, 0, 0], dtype=float)  # quaternion setpoint
-        self.qc_sp = np.array([1, 0, 0, 0], dtype=float)  # quaternion camera setpoint (based on psi)
+        self.q_sp = self.q  # quaternion setpoint
+        self.qc_sp = self.q   # quaternion camera setpoint (based on psi)
         self.z_i = 0  # z error integrator
 
         # start main loop on timer
@@ -204,8 +246,18 @@ class Simulator(Node):
             self.est_x, self.y_accel, self.y_gyro, self.get_param_by_name("g"), self.dt
         )
         self.est_x = np.array(res, dtype=float).reshape(-1)
+        self.q[0] = self.est_x[6]
+        self.q[1] = self.est_x[7]
+        self.q[2] = self.est_x[8]
+        self.q[3] = self.est_x[9]
 
-        X1, P1 = self.eqs["position_correction"](self.est_x, self.y_gps_pos, self.dt, self.P_temp)
+        X1, P1 = self.eqs["position_correction"](
+            self.est_x, self.lla, self.dt, self.P_temp
+        )
+
+        # print(X1)
+        # print(P1)
+
         self.est_x = np.array(X1, dtype=float).reshape(-1)
         self.P_temp = np.array(P1, dtype=float)
 
@@ -215,33 +267,27 @@ class Simulator(Node):
         #     )
         # ).reshape(-1)
 
-        DECLANATION = 0
-        accel_gain = 0.04
-        mag_gain = 0.04
 
-        # new code
-        temp_q, P_new = self.eqs["attitude_estimator"](
+        self.q, self.P  = self.eqs["attitude_estimator"](
             self.q,
             self.y_mag,
-            DECLANATION,
+            self.DECLANATION,
             self.y_gyro,
             self.y_accel,
-            accel_gain,
-            mag_gain,
+            self.accel_gain,
+            self.mag_gain,
             self.dt,
             self.P,
         )
-        temp_q = np.array(temp_q, dtype=float)
-        # self.P = np.array(P_new, dtype=float)
+        self.q = np.array(self.q, dtype=float).reshape(-1)
+        self.P = np.array(self.P, dtype=float).reshape(-1)
 
-        self.est_x[6] = temp_q[0]
-        self.est_x[7] = temp_q[1]
-        self.est_x[8] = temp_q[2]
-        self.est_x[9] = temp_q[3]
-        self.q = np.array(
-            [self.est_x[6], self.est_x[7], self.est_x[8], self.est_x[9]],
-            dtype=float,
-        )
+
+        self.est_x[6] = self.q[0]
+        self.est_x[7] = self.q[1]
+        self.est_x[8] = self.q[2]
+        self.est_x[9] = self.q[3]
+
         self.omega = self.y_gyro
         self.pw = np.array([self.est_x[0], self.est_x[1], self.est_x[2]], dtype=float)
         self.vw = np.array([self.est_x[3], self.est_x[4], self.est_x[5]], dtype=float)
@@ -550,10 +596,55 @@ class Simulator(Node):
         # store states and measurements
         # ---------------------------------------------------------------------
         self.x = np.array(res["xf"]).reshape(-1)
-        res["yf_gyro"] = self.model["g_gyro"](res["xf"], self.u, self.p, np.random.randn(3), self.dt)
-        res["yf_accel"] = self.model["g_accel"](res["xf"], self.u, self.p, np.random.randn(3), self.dt)
-        res["yf_mag"] = self.model["g_mag"](res["xf"], self.u, self.p, np.random.randn(3), self.dt)
-        res["yf_gps_pos"] = self.model["g_gps_pos"](res["xf"], self.u, self.p, np.random.randn(3), self.dt)
+        res["yf_gyro"] = self.model["g_gyro"](
+            res["xf"], self.u, self.p, np.random.randn(3), self.dt
+        )
+        res["yf_accel"] = self.model["g_accel"](
+            res["xf"], self.u, self.p, np.random.randn(3), self.dt
+        )
+        res["yf_mag"] = self.model["g_mag"](
+            res["xf"], self.u, self.p, np.random.randn(3), self.dt
+        )
+        res["yf_gps_pos"] = self.model["g_gps_pos"](
+            res["xf"], self.u, self.p, np.random.randn(3), self.dt
+        )
+
+        if self.t-self.last_gps > 0.1: 
+            # GPS Position TODO: Hook up to random walk
+            res["yf_gps_pos"] = self.model["g_gps_pos"](
+                res["xf"], self.u, self.p, np.random.randn(3), self.dt
+            )
+            self.y_gps_pos = np.array(res["yf_gps_pos"]).reshape(-1)
+
+            # GPS local Position W/ Random walk
+            x_index = self.model["x_index"]
+            gps_noise_power = 0.00000001
+            gps_dt = 0.1
+            sigma_gps = np.sqrt(gps_noise_power / gps_dt)
+            tau_gps_random_walk = 10
+            self.last_gps = self.t
+            w_0 = sigma_gps * np.random.randn(3)
+            self.gps_random_walk = (self.gps_random_walk + w_0 * tau_gps_random_walk) * np.exp(-(1/tau_gps_random_walk) * gps_dt)
+
+            pos = np.array([self.x[x_index["position_op_w_0"]], 
+                self.x[x_index["position_op_w_1"]], 
+                self.x[x_index["position_op_w_2"]]])
+            
+            self.y_gps_local = pos + self.gps_random_walk + 0 * np.random.randn(3)
+
+            x_local = float(self.y_gps_local[0])  # East offset [m]
+            y_local = float(self.y_gps_local[1])  # North offset [m]
+            z_local = float(self.y_gps_local[2])  # Up offset [m]
+
+            d_lat = (y_local / self.earth_radius) * (180.0 / np.pi)
+            d_lon = (x_local / (self.earth_radius * np.cos(self.lat0 * np.pi / 180.0))) * (180.0 / np.pi)
+
+            self.lat = self.lat0 + d_lat
+            self.lon = self.lon0 + d_lon
+            self.alt = self.alt0 + z_local
+            self.lla = np.array([self.lat, self.lon, self.alt])
+            
+
         self.y_gyro = np.array(res["yf_gyro"]).reshape(-1)
         self.y_mag = np.array(res["yf_mag"]).reshape(-1)
         self.y_accel = np.array(res["yf_accel"]).reshape(-1)
@@ -665,6 +756,38 @@ class Simulator(Node):
         msg_imu.linear_acceleration.z = self.y_accel[2]
         msg_imu.linear_acceleration_covariance = np.eye(3).reshape(-1)
         self.pub_imu.publish(msg_imu)
+
+        # ------------------------------------
+        # publish gps
+        # ------------------------------------
+        msg_gps = NavSatFix()
+
+        msg_gps = NavSatFix()
+        msg_gps.header.frame_id = "map"
+        msg_gps.header.stamp = msg_clock.clock
+
+        msg_gps.latitude = self.lat
+        msg_gps.longitude = self.lon
+        msg_gps.altitude = self.alt
+        msg_gps.position_covariance_type = NavSatFix.COVARIANCE_TYPE_UNKNOWN
+
+        self.pub_gps.publish(msg_gps)
+
+        # ------------------------------------
+        # publish gps_local
+        # ------------------------------------
+        msg_gps_local = PoseStamped()
+        msg_gps_local.header.frame_id = "map"
+        msg_gps_local.header.stamp = msg_clock.clock
+        msg_gps_local.pose.position.x = float(self.y_gps_local[0])
+        msg_gps_local.pose.position.y = float(self.y_gps_local[1])
+        msg_gps_local.pose.position.z = float(self.y_gps_local[2])
+        msg_gps_local.pose.orientation.w = 1.0
+        msg_gps_local.pose.orientation.x = 0.0
+        msg_gps_local.pose.orientation.y = 0.0
+        msg_gps_local.pose.orientation.z = 0.0
+        self.pub_gps_local.publish(msg_gps_local)
+
 
         # ------------------------------------
         # publish pose with covariance stamped

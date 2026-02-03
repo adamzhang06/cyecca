@@ -51,7 +51,6 @@ def angle_wrap(angle):
     # Shift to [-pi, pi] range
     return ca.if_else(wrapped > ca.pi, wrapped - 2 * ca.pi, wrapped)
 
-
 def derive_control_allocation():
     """
     quadrotor control allocation
@@ -111,9 +110,23 @@ def derive_control_allocation():
 
     f_alloc = ca.Function(
         "control_allocation",
-        [F_max, l, Cm, Ct, T, M],
+        [
+            F_max,
+            l,
+            Cm,
+            Ct,
+            T,
+            M,
+        ],
         [omega, Fp_sum, F_moment, F_thrust, M_sat],
-        ["F_max", "l", "Cm", "Ct", "T", "M"],
+        [
+            "F_max",
+            "l",
+            "Cm",
+            "Ct",
+            "T",
+            "M",
+        ],
         ["omega", "Fp_sum", "F_moment", "F_thrust", "M_sat"],
     )
     return {"f_alloc": f_alloc}
@@ -228,7 +241,11 @@ def derive_input_acro():
     # -------------------------------
     f_input_acro = ca.Function(
         "input_acro",
-        [thrust_trim, thrust_delta, input_aetr],
+        [
+            thrust_trim,
+            thrust_delta,
+            input_aetr
+        ],
         [w, thrust],
         [
             "thrust_trim",
@@ -280,7 +297,12 @@ def derive_input_auto_level():
     # -------------------------------
     f_input_auto_level = ca.Function(
         "input_auto_level",
-        [thrust_trim, thrust_delta, input_aetr, q.param],
+        [
+            thrust_trim,
+            thrust_delta,
+            input_aetr,
+            q.param
+        ],
         [q_r.param, thrust],
         [
             "thrust_trim",
@@ -348,7 +370,21 @@ def derive_attitude_control():
 
     # FUNCTION
     # -------------------------------
-    f_attitude_control = ca.Function("attitude_control", [kp, q, q_r], [omega], ["kp", "q", "q_r"], ["omega"])
+    f_attitude_control = ca.Function(
+        "attitude_control", 
+        [
+            kp,
+            q, 
+            q_r
+        ], 
+        [omega],
+        [
+            "kp",
+            "q",
+            "q_r"
+        ],
+        ["omega"]
+    )
 
     return {"attitude_control": f_attitude_control}
 
@@ -576,7 +612,13 @@ def derive_strapdown_ins_propagation():
     # should do q renormalize check here
     f_ins = ca.Function(
         "strapdown_ins_propagate",
-        [X0.param, a_b, omega_b, g, dt],
+        [   
+            X0.param,
+            a_b,
+            omega_b,
+            g,
+            dt
+        ],
         [X1.param],
         [
             "x0",
@@ -594,6 +636,21 @@ def derive_strapdown_ins_propagation():
 def derive_position_correction():
     ## Initilaizing measurments
     z = ca.SX.sym("gps", 3)
+
+    # Initial GPS location
+    lat0 = 40.4237       # latitude [deg]
+    lon0 = -86.9212      # longitude [deg]
+    alt0 = 190.0         # altitude [m]
+    earth_radius = 6378137.0  # WGS84 radius [m]
+
+    # Convert z to local tangent plane
+    x_local = (z[1] - lon0) * (np.pi / 180) * earth_radius * np.cos(lat0 * np.pi / 180)  # East
+    y_local = (z[0] - lat0) * (np.pi / 180) * earth_radius                              # North
+    z_local = z[2] - alt0                                                               # Up
+
+    z_local_plane = ca.vertcat(x_local, y_local, z_local)
+
+
     dt = ca.SX.sym("dt", 1)
     P = ca.SX.sym("P", 6, 6)
 
@@ -623,7 +680,7 @@ def derive_position_correction():
     K = P_s @ H.T @ ca.inv(y)
 
     # Update estimate w/ measurment
-    x_new = x0 + K @ (z - H @ x0)
+    x_new = x0 + K @ (z_local_plane - H @ x0)
 
     # Update the measurement uncertainty
     P_new = (np.eye(6) - (K @ H)) @ P_s
