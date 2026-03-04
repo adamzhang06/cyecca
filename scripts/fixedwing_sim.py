@@ -11,6 +11,7 @@ from rclpy.parameter import Parameter
 from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import Joy
 from std_msgs.msg import String
+from std_srvs.srv import Empty # added for reset for RL training
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 from visualization_msgs.msg import Marker
 
@@ -120,6 +121,8 @@ class Simulator(Node):
             self.get_parameter("mocap_vehicle_id").get_parameter_value().string_value + "/mode_marker",
             1,
         )
+        self.srv_reset = self.create_service(
+            Empty, 'reset_simulation', self.reset_callback)
 
         # -------------------------------------------------------
         # Dynamics
@@ -202,6 +205,19 @@ class Simulator(Node):
         m.pose.position.y = 0.0
         m.pose.position.z = 0.25
         self.pub_mode_marker.publish(m)
+    
+    def reset_callback(self, request, response):
+        self.get_logger().info('Resetting simulation state...')
+        
+        # Reset the physics state to initial values
+        self.state = np.array(list(self.x0_dict.values()), dtype=float)
+        
+        # Reset control inputs
+        self.u = np.zeros(4, dtype=float)
+        self.input_aetr = ca.DM.zeros(4)
+        self.input_auto = ca.DM.zeros(4)
+        
+        return response
 
     def clock_as_msg(self):
         msg = Clock()
